@@ -1,0 +1,32 @@
+name: newsbot
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      max_articles:
+        description: '這次最多改寫幾則'
+        required: false
+        default: '2'
+permissions:
+  contents: read
+  models: read      # GitHub Models（用 GITHUB_TOKEN 呼叫）
+  id-token: write   # 向 twinfo.huhm.cc 證明身分（GitHub OIDC，不需要 repo secret）
+concurrency:
+  group: newsbot
+  cancel-in-progress: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 9
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: 抓新聞、改寫、送到網站
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEWS_INGEST_TOKEN: ${{ secrets.NEWS_INGEST_TOKEN }}
+          MAX_ARTICLES: ${{ github.event.inputs.max_articles || '2' }}
+        run: python newsbot.py
