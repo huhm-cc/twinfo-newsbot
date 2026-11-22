@@ -235,9 +235,13 @@ def chat(messages, max_tokens=2600, temperature=0.4):
         body = json.dumps({"model": m, "messages": messages, "temperature": temperature, "max_tokens": max_tokens, "response_format": {"type": "json_object"}}).encode()
         for attempt in range(2):
             try:
-                _, b = http("https://models.github.ai/inference/chat/completions", data=body, method="POST", timeout=120,
-                            headers={"Authorization": f"Bearer {tok}", "content-type": "application/json", "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"})
-                j = json.loads(b)
+                st, b = http("https://models.github.ai/inference/chat/completions", data=body, method="POST", timeout=120,
+                            headers={"Authorization": f"Bearer {tok}", "content-type": "application/json", "Accept": "application/json", "X-GitHub-Api-Version": "2022-11-28"})
+                try:
+                    j = json.loads(b)
+                except Exception:
+                    log(f"[model] {m} 回應不是 JSON（HTTP {st}）：{b[:300]!r}")
+                    raise
                 return m, j["choices"][0]["message"]["content"]
             except urllib.error.HTTPError as e:
                 msg = e.read().decode("utf-8", "ignore")[:300]
