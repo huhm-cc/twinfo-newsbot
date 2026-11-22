@@ -27,4 +27,5 @@ jobs:
         env:
           NEWS_INGEST_TOKEN: ${{ secrets.NEWS_INGEST_TOKEN }}
           MAX_ARTICLES: ${{ github.event.inputs.max_articles || '2' }}
+          DAILY_CAP: '80'
         run: python newsbot.py

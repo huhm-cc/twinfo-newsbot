@@ -6,6 +6,7 @@
   SITE                    預設 https://twinfo.huhm.cc
   MAX_ARTICLES            每次最多改寫幾則（預設 2，新事件很多時 3）
   MODELS                  逗號分隔，依序嘗試（遇到額度用完 429 換下一個，全部用完就跳過，不算失敗）
+  DAILY_CAP               每天最多幾篇（預設 80，依時間平均分配）
   DRY_RUN=1               不呼叫模型也不寫入，只印出選到的事件
 """
 import concurrent.futures as cf
@@ -28,6 +29,7 @@ UA = "Mozilla/5.0 (compatible; twinfo-newsbot/1.0; +https://github.com/huhm-cc/t
 MODELS = [m.strip() for m in os.environ.get("MODELS", "google/gemini-2.5-flash-lite,openai/gpt-4.1-nano").split(",") if m.strip()]
 MAX_ARTICLES = int(os.environ.get("MAX_ARTICLES", "2"))
 DRY = os.environ.get("DRY_RUN") == "1"
+DAILY_CAP = int(os.environ.get("DAILY_CAP", "80"))  # 每天最多幾篇，平均分散到 24 小時（控制 LLM 免費額度）
 MAX_AGE_H = 8  # 只處理 8 小時內的新聞
 
 # (來源名稱, RSS 網址, 預設分類, 權重)
@@ -396,6 +398,13 @@ def main():
 
     clusters.sort(key=score, reverse=True)
     n = MAX_ARTICLES + (1 if len(clusters) >= 25 and MAX_ARTICLES < 3 else 0)
+    today = now.strftime("%Y-%m-%d")
+    done_today = sum(1 for r in recent if str(r.get("published_at", "")).startswith(today))
+    allowed = int(DAILY_CAP * (now.hour + now.minute / 60 + 1) / 24) - done_today
+    if allowed <= 0:
+        log(f"今天已發 {done_today} 篇，依每日上限 {DAILY_CAP} 的時間配額，本次不改寫")
+        return
+    n = min(n, allowed)
     picks = clusters[: n * 2]  # 多抓一些候選，原文太短的跳過
     for c in picks[:n * 2]:
         log(f"候選（{score(c):.1f}）：" + " | ".join(f"{y['source']}:{y['title']}" for y in c))
