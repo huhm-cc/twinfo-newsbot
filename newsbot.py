@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Taiwan INFO newsbot：抓台灣新聞 RSS → 去重、合併同一事件 → 經網站 /api/news/rewrite（Vercel AI Gateway／Google AI Studio）改寫成中英文章 → POST 到 twinfo.huhm.cc。
+"""Taiwan INFO newsbot：抓台灣新聞 RSS → 去重、合併同一事件 → 經網站 /api/news/rewrite（NVIDIA API nemotron-3.5-bolt-e4b；備援 Google AI Studio／Vercel AI Gateway）改寫成中英文章 → POST 到 twinfo.huhm.cc。
 
 只用 Python 標準函式庫。環境變數：
   NEWS_INGEST_TOKEN       （可選）網站寫入 token；沒有時改用 GitHub Actions OIDC（permissions: id-token: write）
@@ -26,7 +26,7 @@ from datetime import datetime, timedelta, timezone
 TZ = timezone(timedelta(hours=8))
 SITE = os.environ.get("SITE", "https://twinfo.huhm.cc").rstrip("/")
 UA = "Mozilla/5.0 (compatible; twinfo-newsbot/1.0; +https://github.com/huhm-cc/twinfo-newsbot)"
-MODELS = [m.strip() for m in os.environ.get("MODELS", "google/gemini-2.5-flash-lite,openai/gpt-4.1-nano").split(",") if m.strip()]
+MODELS = [m.strip() for m in os.environ.get("MODELS", "nvidia/nemotron-3.5-bolt-e4b,google/gemini-2.5-flash-lite").split(",") if m.strip()]
 MAX_ARTICLES = int(os.environ.get("MAX_ARTICLES", "2"))
 DRY = os.environ.get("DRY_RUN") == "1"
 DAILY_CAP = int(os.environ.get("DAILY_CAP", "80"))  # 每天最多幾篇，平均分散到 24 小時（控制 LLM 免費額度）
@@ -230,7 +230,7 @@ dead_models = set()
 
 def chat(messages, max_tokens=2600, temperature=0.4):
     """經由網站 /api/news/rewrite 呼叫 LLM（GitHub Models 已於 2026-07-30 停止服務）。
-    網站端用 Vercel AI Gateway 或 Google AI Studio；額度用完／尚未開通時換下一個模型，全部不行就跳過本次。"""
+    網站端主要用 NVIDIA API（NVIDIA_API_KEY），備援 Google AI Studio／Vercel AI Gateway；額度用完／尚未開通時換下一個模型，全部不行就跳過本次。"""
     for m in MODELS:
         if m in dead_models:
             continue
@@ -272,8 +272,9 @@ SYSTEM = """你是 Taiwan INFO 台灣資訊的新聞編輯。你會拿到同一�
 5. 中文正文 3–5 段，段落之間用 \\n\\n 分隔，總長 260–450 字（不含標點），第一段是導言（誰、什麼事、何時、何地）。
 6. 英文正文是同一篇的英文版（不是逐字翻譯也可），3–5 段，180–320 個英文字，使用一般國際媒體寫法（例如 Taiwan's Central Election Commission、New Taiwan dollars (NT$)）。
 7. 不要在文末列出來源、不要 hashtag、不要 emoji、不要問句互動。
+8. 英文版金額單位換算要正確：1 億 = 100 million，10 億 = 1 billion。例如 811 億元 = NT$81.1 billion，3.5 億元 = NT$350 million，1.2 兆元 = NT$1.2 trillion；美元同理（US$）。
 
-只輸出一個 JSON 物件，欄位：
+只輸出一個 JSON 物件（不要 ``` 程式碼區塊、不要任何說明文字），欄位：
 {"category": "news" 或 "tech"（科技、AI、半導體、資安、網路、電子產業歸 tech，其餘 news）,
  "title_zh": "中文標題，14–30 字，不可與任何原始標題相同",
  "title_en": "English headline",
@@ -313,6 +314,30 @@ def shingle_ratio(art, src, k=8):
     return sum(1 for x in sh if x in s) / len(sh)
 
 
+def parse_json_obj(out):
+    """模型可能把 JSON 包在說明文字或 ``` 裡，或先輸出 <think>…</think>；找出第一個可解析的 JSON 物件。"""
+    s = re.sub(r"<think>.*?</think>", "", str(out or ""), flags=re.S).strip()
+    cands = [s] + [m.strip() for m in re.findall(r"```(?:json|JSON)?\s*(.*?)```", s, re.S)]
+    for c in cands:
+        try:
+            v = json.loads(c)
+            if isinstance(v, dict):
+                return v
+        except Exception:
+            pass
+    dec = json.JSONDecoder()
+    i = s.find("{")
+    while i >= 0:
+        try:
+            v, _ = dec.raw_decode(s[i:])
+            if isinstance(v, dict):
+                return v
+        except Exception:
+            pass
+        i = s.find("{", i + 1)
+    raise ValueError("JSON 解析失敗")
+
+
 def rewrite(cluster):
     src_blocks, total = [], 0
     per = max(1200, 4800 // len(cluster))
@@ -327,35 +352,51 @@ def rewrite(cluster):
     msgs = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}]
     raw_src = "\n".join(it["title"] + "\n" + it["body"] for it in cluster)
     last_err = None
-    for attempt in range(2):
+    expanded = recopied = json_retry = False  # 擴寫、抄寫退回、JSON 重試各最多一次
+    for attempt in range(4):
         model, out = chat(msgs, temperature=0.5 if attempt == 0 else 0.7)
         try:
-            a = json.loads(out)
+            a = parse_json_obj(out)
         except Exception:
             last_err = "JSON 解析失敗"
-            msgs = msgs[:2] + [{"role": "assistant", "content": out[:3000]}, {"role": "user", "content": "請只輸出合法 JSON。"}]
+            log(f"[rewrite] 第 {attempt + 1} 次 JSON 解析失敗：{str(out)[:200]!r}")
+            if json_retry:
+                break
+            json_retry = True
+            msgs = msgs[:2] + [{"role": "assistant", "content": str(out)[:3000]}, {"role": "user", "content": "請只輸出一個合法 JSON 物件，不要 ``` 也不要任何說明文字。"}]
             continue
-        probs = []
         zh, en = str(a.get("article_zh") or ""), str(a.get("article_en") or "")
-        if han_len(zh) < 220:
-            probs.append(f"中文正文只有 {han_len(zh)} 字，需要 260–450 字（只能用原文已有事實擴寫背景，不可捏造）")
-        if len(en.split()) < 120:
-            probs.append("英文正文太短，需要 180–320 字")
+        n_zh = han_len(zh)
         segs = copied_segments(zh, raw_src)
         ratio = shingle_ratio(zh, raw_src)
-        if segs or ratio > 0.22:
-            probs.append("以下片段與原文幾乎相同，請完全改用自己的句子重寫：" + "；".join(segs[:6]) + f"（重複比例 {ratio:.0%}）")
-        if any(norm(a.get("title_zh", "")) == norm(it["title"]) for it in cluster):
-            probs.append("中文標題不可與原始標題相同")
+        copied = bool(segs) or ratio > 0.22
+        title_same = any(norm(a.get("title_zh", "")) == norm(it["title"]) for it in cluster)
+        short_en = len(en.split()) < 120
         if a.get("category") not in ("news", "tech"):
             a["category"] = cluster[0]["cat"]
-        if not probs:
+        fatal = []
+        if n_zh < 200:
+            fatal.append(f"中文正文只有 {n_zh} 字，至少要 260 字（只能用原始報導裡已有的事實擴寫細節與背景，不可捏造任何原文沒有的內容）")
+        if copied:
+            fatal.append("以下片段與原文幾乎相同，請完全改用自己的句子重寫：" + "；".join(segs[:6]) + f"（重複比例 {ratio:.0%}）")
+        if title_same:
+            fatal.append("中文標題不可與原始標題相同，請換一個說法")
+        soft = ["英文正文太短，需要 180–320 個英文字"] if short_en else []
+        if not fatal and (not soft or attempt > 0):
             a["_model"] = model
             a["_ratio"] = round(ratio, 3)
             return a
-        last_err = "；".join(probs)
+        # 擴寫最多一次、抄寫退回最多一次；已用過就放棄
+        if (n_zh < 200 and expanded) or (copied and recopied):
+            last_err = "；".join(fatal)
+            break
+        if n_zh < 200:
+            expanded = True
+        if copied:
+            recopied = True
+        last_err = "；".join(fatal + soft)
         log(f"[rewrite] 第 {attempt + 1} 次不合格：{last_err[:300]}")
-        msgs = msgs[:2] + [{"role": "assistant", "content": out[:4000]}, {"role": "user", "content": "這篇不合格：" + last_err + "。請修正後重新輸出完整 JSON。"}]
+        msgs = msgs[:2] + [{"role": "assistant", "content": json.dumps(a, ensure_ascii=False)[:4000]}, {"role": "user", "content": "這篇不合格：" + last_err + "。請修正後重新輸出完整 JSON（所有欄位都要有）。"}]
     raise ValueError(last_err or "改寫失敗")
 
 
