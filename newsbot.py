@@ -273,7 +273,7 @@ SYSTEM = """你是 Taiwan INFO 台灣資訊的新聞編輯。你會拿到同一�
 6. 英文正文是同一篇的英文版（不是逐字翻譯也可），3–5 段，180–320 個英文字，使用一般國際媒體寫法（例如 Taiwan's Central Election Commission、New Taiwan dollars (NT$)）。
 7. 不要在文末列出來源、不要 hashtag、不要 emoji、不要問句互動。
 8. 英文版金額單位換算要正確：1 億 = 100 million，10 億 = 1 billion。例如 811 億元 = NT$81.1 billion，811.8 億元 = NT$81.18 billion（保留原數字的精確度），98.5 億元 = NT$9.85 billion，3.5 億元 = NT$350 million，1.2 兆元 = NT$1.2 trillion；美元同理（US$）。本益比是 price-to-earnings (P/E) ratio。
-9. 英文專有名詞不可自創：民進黨 = Democratic Progressive Party (DPP)，國民黨 = Kuomintang (KMT)，民眾黨 = Taiwan People's Party (TPP)，時代力量 = New Power Party，金管會 = Financial Supervisory Commission，中選會 = Central Election Commission，九合一選舉 = local elections，立法院 = Legislative Yuan，行政院 = Executive Yuan。公司或機構若不確定官方英文名，用通行英文名（例如 安聯投信 = Allianz Global Investors Taiwan），仍不確定就用羅馬拼音，不可翻成意思不同的名稱。
+9. 「」引號裡的活動名稱、口號、政策名稱、作品名稱（例如「嘉鄉味」）中文版一字不改照抄，不可換成同音字。英文專有名詞不可自創：民進黨 = Democratic Progressive Party (DPP)，國民黨 = Kuomintang (KMT)，民眾黨 = Taiwan People's Party (TPP)，時代力量 = New Power Party，金管會 = Financial Supervisory Commission，中選會 = Central Election Commission，九合一選舉 = local elections，立法院 = Legislative Yuan，行政院 = Executive Yuan。公司或機構若不確定官方英文名，用通行英文名（例如 安聯投信 = Allianz Global Investors Taiwan），仍不確定就用羅馬拼音，不可翻成意思不同的名稱。
 
 只輸出一個 JSON 物件（不要 ``` 程式碼區塊、不要任何說明文字），欄位：
 {"category": "news" 或 "tech"（科技、AI、半導體、資安、網路、電子產業歸 tech，其餘 news）,
@@ -386,6 +386,9 @@ def rewrite(cluster):
         if title_same:
             fatal.append("中文標題不可與原始標題相同，請換一個說法")
         soft = ["英文正文太短，需要 180–320 個英文字"] if short_en else []
+        for q in sorted({q for it in cluster for q in re.findall(r"[「『“\"]([^」』”\"]{2,12})[」』”\"]", it["title"])}):
+            if q not in zh:
+                fatal.append(f"原文的專有名稱「{q}」必須一字不改照抄（目前文章沒有出現或寫錯了）")
         for zk, ek in GLOSSARY:
             if zk in zh and ek.lower() not in en.lower():
                 soft.append(f"英文版「{zk}」要寫成 {ek}")
