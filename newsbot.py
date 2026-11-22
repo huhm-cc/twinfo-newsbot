@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Taiwan INFO newsbot：抓台灣新聞 RSS → 去重、合併同一事件 → 用 GitHub Models 改寫成中英文章 → POST 到 twinfo.huhm.cc。
+"""Taiwan INFO newsbot：抓台灣新聞 RSS → 去重、合併同一事件 → 經網站 /api/news/rewrite（Vercel AI Gateway／Google AI Studio）改寫成中英文章 → POST 到 twinfo.huhm.cc。
 
 只用 Python 標準函式庫。環境變數：
-  GITHUB_TOKEN            GitHub Models 用（Actions 內 permissions: models: read）
   NEWS_INGEST_TOKEN       （可選）網站寫入 token；沒有時改用 GitHub Actions OIDC（permissions: id-token: write）
   SITE                    預設 https://twinfo.huhm.cc
   MAX_ARTICLES            每次最多改寫幾則（預設 2，新事件很多時 3）
@@ -26,7 +25,7 @@ from datetime import datetime, timedelta, timezone
 TZ = timezone(timedelta(hours=8))
 SITE = os.environ.get("SITE", "https://twinfo.huhm.cc").rstrip("/")
 UA = "Mozilla/5.0 (compatible; twinfo-newsbot/1.0; +https://github.com/huhm-cc/twinfo-newsbot)"
-MODELS = [m.strip() for m in os.environ.get("MODELS", "openai/gpt-4.1-mini,openai/gpt-4o-mini,openai/gpt-4.1-nano").split(",") if m.strip()]
+MODELS = [m.strip() for m in os.environ.get("MODELS", "google/gemini-2.5-flash-lite,openai/gpt-4.1-nano").split(",") if m.strip()]
 MAX_ARTICLES = int(os.environ.get("MAX_ARTICLES", "2"))
 DRY = os.environ.get("DRY_RUN") == "1"
 MAX_AGE_H = 8  # 只處理 8 小時內的新聞
@@ -228,39 +227,37 @@ dead_models = set()
 
 
 def chat(messages, max_tokens=2600, temperature=0.4):
-    tok = os.environ.get("GITHUB_TOKEN", "")
+    """經由網站 /api/news/rewrite 呼叫 LLM（GitHub Models 已於 2026-07-30 停止服務）。
+    網站端用 Vercel AI Gateway 或 Google AI Studio；額度用完／尚未開通時換下一個模型，全部不行就跳過本次。"""
     for m in MODELS:
         if m in dead_models:
             continue
-        body = json.dumps({"model": m, "messages": messages, "temperature": temperature, "max_tokens": max_tokens, "response_format": {"type": "json_object"}}).encode()
+        body = json.dumps({"model": m, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}).encode()
         for attempt in range(2):
             try:
-                st, b = http("https://models.github.ai/inference/chat/completions", data=body, method="POST", timeout=120,
-                            headers={"Authorization": f"Bearer {tok}", "content-type": "application/json", "Accept": "application/json", "X-GitHub-Api-Version": "2022-11-28"})
-                try:
-                    j = json.loads(b)
-                except Exception:
-                    log(f"[model] {m} 回應不是 JSON（HTTP {st}）：{b[:300]!r}")
-                    raise
+                st, b = http(f"{SITE}/api/news/rewrite", data=body, method="POST", timeout=150, headers={**site_auth(), "content-type": "application/json"})
+                j = json.loads(b)
                 return m, j["choices"][0]["message"]["content"]
             except urllib.error.HTTPError as e:
                 msg = e.read().decode("utf-8", "ignore")[:300]
                 log(f"[model] {m} HTTP {e.code}: {msg}")
-                if e.code == 429:
+                if e.code == 429 and attempt == 0:
                     ra = int(e.headers.get("retry-after", "0") or 0)
-                    if 0 < ra <= 65 and attempt == 0:  # 每分鐘限制：等一下再試
+                    if 0 < ra <= 65:
                         time.sleep(ra)
                         continue
-                    dead_models.add(m)  # 每日額度用完
-                    break
-                if e.code in (401, 403, 404, 400, 413):
-                    dead_models.add(m)
-                    break
-                time.sleep(3)
+                if e.code >= 500 and attempt == 0:
+                    time.sleep(5)
+                    continue
+                dead_models.add(m)  # 額度用完、未開通、模型不存在
+                break
             except Exception as e:
                 log(f"[model] {m} 錯誤：{e}")
-                time.sleep(3)
-    raise QuotaExhausted("所有模型都無法使用（多半是 GitHub Models 每日免費額度用完）")
+                if attempt == 0:
+                    time.sleep(3)
+                    continue
+                dead_models.add(m)
+    raise QuotaExhausted("所有模型都無法使用（LLM 額度用完或尚未開通）")
 
 
 SYSTEM = """你是 Taiwan INFO 台灣資訊的新聞編輯。你會拿到同一則新聞事件的一或多篇原始報導，請「用自己的話」重新寫成一篇新的新聞稿，避免任何著作權爭議。

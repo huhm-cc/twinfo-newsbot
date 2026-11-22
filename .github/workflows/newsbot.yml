@@ -10,7 +10,6 @@ on:
         default: '2'
 permissions:
   contents: read
-  models: read      # GitHub Models（用 GITHUB_TOKEN 呼叫）
   id-token: write   # 向 twinfo.huhm.cc 證明身分（GitHub OIDC，不需要 repo secret）
 concurrency:
   group: newsbot
@@ -26,7 +25,6 @@ jobs:
           python-version: '3.12'
       - name: 抓新聞、改寫、送到網站
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NEWS_INGEST_TOKEN: ${{ secrets.NEWS_INGEST_TOKEN }}
           MAX_ARTICLES: ${{ github.event.inputs.max_articles || '2' }}
         run: python newsbot.py
