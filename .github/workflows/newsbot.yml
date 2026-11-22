@@ -1,7 +1,7 @@
 name: newsbot
 on:
   schedule:
-    - cron: '3-59/10 * * * *'   # 每 10 分鐘（避開整點高峰）
+    - cron: '3-59/10 * * * *'   # 每 10 分鐘（避開整點高峰；2026-11-22 重新註冊排程）
   workflow_dispatch:
     inputs:
       max_articles:
