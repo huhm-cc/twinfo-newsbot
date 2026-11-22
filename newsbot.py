@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Taiwan INFO newsbot：抓台灣新聞 RSS → 去重、合併同一事件 → 經網站 /api/news/rewrite（NVIDIA API nemotron-3.5-bolt-e4b；備援 Google AI Studio／Vercel AI Gateway）改寫成中英文章 → POST 到 twinfo.huhm.cc。
+"""Taiwan INFO newsbot：抓台灣新聞 RSS → 去重、合併同一事件 → 經網站 /api/news/rewrite 兩階段 AI：
+AI#1 撰稿（role=writer，NVIDIA nemotron-3.5-bolt-e4b）→ 程式檢查（抄寫、字數、引號名稱、台灣視角代稱）→
+AI#2 審稿（role=reviewer，NVIDIA nemotron-3-ultra-550b-a55b，關思考，附原始報導全文）→ 有錯退回 AI#1，最多 3 輪 → 通過才 POST 到 twinfo.huhm.cc。
 
 只用 Python 標準函式庫。環境變數：
   NEWS_INGEST_TOKEN       （可選）網站寫入 token；沒有時改用 GitHub Actions OIDC（permissions: id-token: write）
   SITE                    預設 https://twinfo.huhm.cc
   MAX_ARTICLES            每次最多改寫幾則（預設 2，新事件很多時 3）
+  REVIEW_MODELS           審稿模型（預設 nvidia/nemotron-3-ultra-550b-a55b）
+  TIME_BUDGET             秒，超過不再開始新的一篇（預設 390）
   MODELS                  逗號分隔，依序嘗試（遇到額度用完 429 換下一個，全部用完就跳過，不算失敗）
   DAILY_CAP               每天最多幾篇（預設 80，依時間平均分配）
   DRY_RUN=1               不呼叫模型也不寫入，只印出選到的事件
@@ -31,6 +35,8 @@ MAX_ARTICLES = int(os.environ.get("MAX_ARTICLES", "2"))
 DRY = os.environ.get("DRY_RUN") == "1"
 DAILY_CAP = int(os.environ.get("DAILY_CAP", "80"))  # 每天最多幾篇，平均分散到 24 小時（控制 LLM 免費額度）
 MAX_AGE_H = 8  # 只處理 8 小時內的新聞
+REVIEW_MAX_TOKENS = int(os.environ.get("REVIEW_MAX_TOKENS", "3000"))
+TIME_BUDGET = int(os.environ.get("TIME_BUDGET", "390"))  # 秒；超過就不再開始新的一篇（workflow timeout 9 分鐘）
 
 # (來源名稱, RSS 網址, 預設分類, 權重)
 FEEDS = [
@@ -228,13 +234,22 @@ class QuotaExhausted(Exception):
 dead_models = set()
 
 
-def chat(messages, max_tokens=2600, temperature=0.4):
+# 審稿模型：2026-11-22 實測 nemotron-3.5-lightning-30b-a3b 不穩定（開思考會把 6000 token 用完、漏抓安聯投信誤譯；關思考會要求標題照抄原文、輸出到上限），
+# 改用同一把 NVIDIA 金鑰的 nemotron-3-ultra-550b-a55b（關思考，約 5–20 秒，能抓到 Union Asset Management、earnings per share 誤譯）
+REVIEW_MODELS = [m.strip() for m in os.environ.get("REVIEW_MODELS", "nvidia/nemotron-3-ultra-550b-a55b").split(",") if m.strip()]
+REVIEW_THINKING = os.environ.get("REVIEW_THINKING", "0") == "1"
+
+
+def chat(messages, max_tokens=2600, temperature=0.4, role="writer", thinking=None):
     """經由網站 /api/news/rewrite 呼叫 LLM（GitHub Models 已於 2026-07-30 停止服務）。
     網站端主要用 NVIDIA API（NVIDIA_API_KEY），備援 Google AI Studio／Vercel AI Gateway；額度用完／尚未開通時換下一個模型，全部不行就跳過本次。"""
-    for m in MODELS:
+    for m in (REVIEW_MODELS if role == "reviewer" else MODELS):
         if m in dead_models:
             continue
-        body = json.dumps({"model": m, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}).encode()
+        req = {"role": role, "model": m, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
+        if thinking is not None:
+            req["thinking"] = thinking
+        body = json.dumps(req).encode()
         for attempt in range(2):
             try:
                 st, b = http(f"{SITE}/api/news/rewrite", data=body, method="POST", timeout=150, headers={**site_auth(), "content-type": "application/json"})
@@ -259,7 +274,7 @@ def chat(messages, max_tokens=2600, temperature=0.4):
                     time.sleep(3)
                     continue
                 dead_models.add(m)
-    raise QuotaExhausted("所有模型都無法使用（LLM 額度用完或尚未開通）")
+    raise QuotaExhausted(f"所有{'審稿' if role == 'reviewer' else '撰稿'}模型都無法使用（LLM 額度用完或尚未開通）")
 
 
 SYSTEM = """你是 Taiwan INFO 台灣資訊的新聞編輯。你會拿到同一則新聞事件的一或多篇原始報導，請「用自己的話」重新寫成一篇新的新聞稿，避免任何著作權爭議。
@@ -274,6 +289,8 @@ SYSTEM = """你是 Taiwan INFO 台灣資訊的新聞編輯。你會拿到同一�
 7. 不要在文末列出來源、不要 hashtag、不要 emoji、不要問句互動。
 8. 英文版金額單位換算要正確：1 億 = 100 million，10 億 = 1 billion。例如 811 億元 = NT$81.1 billion，811.8 億元 = NT$81.18 billion（保留原數字的精確度），98.5 億元 = NT$9.85 billion，3.5 億元 = NT$350 million，1.2 兆元 = NT$1.2 trillion；美元同理（US$）。本益比是 price-to-earnings (P/E) ratio。
 9. 「」引號裡的活動名稱、口號、政策名稱、作品名稱（例如「嘉鄉味」）中文版一字不改照抄，不可換成同音字。英文專有名詞不可自創：民進黨 = Democratic Progressive Party (DPP)，國民黨 = Kuomintang (KMT)，民眾黨 = Taiwan People's Party (TPP)，時代力量 = New Power Party，金管會 = Financial Supervisory Commission，中選會 = Central Election Commission，九合一選舉 = local elections，立法院 = Legislative Yuan，行政院 = Executive Yuan。公司或機構若不確定官方英文名，用通行英文名（例如 安聯投信 = Allianz Global Investors Taiwan），仍不確定就用羅馬拼音，不可翻成意思不同的名稱。
+
+10. 不要用站在台灣視角的代稱「本國」「我國」「國內」「本土」「國人」「本國銀行」等，一律明寫「台灣」（例如 本國銀行 → 台灣的銀行、國內市場 → 台灣市場、國人 → 台灣民眾）；英文用 Taiwan／Taiwanese（例如 Taiwan's banks、Taiwanese banks），不可用 domestic、our country、local banks。
 
 只輸出一個 JSON 物件（不要 ``` 程式碼區塊、不要任何說明文字），欄位：
 {"category": "news" 或 "tech"（科技、AI、半導體、資安、網路、電子產業歸 tech，其餘 news）,
@@ -342,61 +359,90 @@ def parse_json_obj(out):
     raise ValueError("JSON 解析失敗")
 
 
-def rewrite(cluster):
-    src_blocks, total = [], 0
-    per = max(1200, 4800 // len(cluster))
+TW_POV_ZH = re.compile(r"(本國|我國|國內(?!生產毛額)|(?<!台灣)本土|國人)")
+TW_POV_EN = re.compile(r"\b(domestic|our country|local banks?)\b", re.I)
+
+
+def source_text(cluster, full=False):
+    """撰稿用每篇截斷；審稿用全文（full=True，總長上限約 16000 字）。"""
+    blocks = []
+    per = max(1200, 4800 // len(cluster)) if not full else max(4000, 16000 // len(cluster))
     for i, it in enumerate(cluster, 1):
-        txt = it["body"][:per]
-        total += len(txt)
-        pub = it["published"].strftime("%Y-%m-%d %H:%M") if it["published"] else "不明"
-        src_blocks.append(f"【報導 {i}】來源：{it['source']}｜發布時間（台北）：{pub}\n標題：{it['title']}\n內文：\n{txt}")
-    joined = "\n\n".join(src_blocks)
+        pub = it["published"].strftime("%Y-%m-%d %H:%M") if it.get("published") else "不明"
+        blocks.append(f"【報導 {i}】來源：{it['source']}｜發布時間（台北）：{pub}\n標題：{it['title']}\n內文：\n{it['body'][:per]}")
+    return "\n\n".join(blocks)
+
+
+def fmt_issues(issues):
+    return "\n".join(f"- [{x.get('field')}] 「{x.get('wrong')}」→「{x.get('correct')}」：{x.get('reason')}" for x in issues)
+
+
+def local_check(a, cluster, raw_src):
+    """AI#2 之前的程式檢查。回傳 (fatal, soft, n_zh, copied, ratio)。"""
+    zh, en = str(a.get("article_zh") or ""), str(a.get("article_en") or "")
+    n_zh = han_len(zh)
+    segs = copied_segments(zh, raw_src)
+    ratio = shingle_ratio(zh, raw_src)
+    copied = bool(segs) or ratio > 0.22
+    fatal, soft = [], []
+    if n_zh < 200:
+        fatal.append(f"中文正文只有 {n_zh} 字，至少要 260 字（只能用原始報導裡已有的事實擴寫細節與背景，不可捏造任何原文沒有的內容）")
+    if copied:
+        fatal.append("以下片段與原文幾乎相同，請完全改用自己的句子重寫：" + "；".join(segs[:6]) + f"（重複比例 {ratio:.0%}）")
+    if any(norm(a.get("title_zh", "")) == norm(it["title"]) for it in cluster):
+        fatal.append("中文標題不可與原始標題相同，請換一個說法")
+    for q in sorted({q for it in cluster for q in re.findall(r"[「『“\"]([^」』”\"]{2,12})[」』”\"]", it["title"])}):
+        if q not in zh:
+            fatal.append(f"原文的專有名稱「{q}」必須一字不改照抄（目前文章沒有出現或寫錯了）")
+    zh_all = " ".join(str(a.get(k) or "") for k in ("title_zh", "summary_zh", "article_zh")) + " " + " ".join(map(str, a.get("tags") or []))
+    en_all = " ".join(str(a.get(k) or "") for k in ("title_en", "summary_en", "article_en"))
+    pov = sorted(set(TW_POV_ZH.findall(zh_all)))
+    if pov:
+        fatal.append("不可用「" + "、".join(pov) + "」這種站在台灣視角的代稱，一律明寫「台灣」（例如 本國銀行→台灣的銀行、國內→台灣、國人→台灣民眾）")
+    pov_en = sorted({m.lower() for m in TW_POV_EN.findall(en_all)})
+    if pov_en:
+        fatal.append("英文版不可用 " + "、".join(pov_en) + "，請明寫 Taiwan／Taiwanese（例如 Taiwanese banks、Taiwan's market）")
+    if len(en.split()) < 120:
+        soft.append("英文正文太短，需要 180–320 個英文字")
+    for zk, ek in GLOSSARY:
+        if zk in zh and ek.lower() not in en.lower():
+            soft.append(f"英文版「{zk}」要寫成 {ek}")
+    return fatal, soft, n_zh, copied, ratio
+
+
+def rewrite(cluster, prev=None, issues=None):
+    """AI#1 撰稿。prev＋issues 有值時是依審稿意見修改。內含程式檢查（抄寫、字數、引號名稱、台灣視角代稱）。"""
     now = datetime.now(TZ).strftime("%Y 年 %m 月 %d 日 %H:%M")
-    user = f"現在時間（台北）：{now}\n\n以下是同一事件的原始報導，請依規則改寫：\n\n{joined}"
-    msgs = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}]
+    user = f"現在時間（台北）：{now}\n\n以下是同一事件的原始報導，請依規則改寫：\n\n{source_text(cluster)}"
+    base = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}]
+    msgs = base
+    if prev is not None:
+        keep = {k: prev.get(k) for k in ("category", "title_zh", "title_en", "summary_zh", "summary_en", "article_zh", "article_en", "tags", "slug")}
+        msgs = base + [{"role": "assistant", "content": json.dumps(keep, ensure_ascii=False)[:6000]},
+                       {"role": "user", "content": "審稿編輯發現以下問題，請逐條修正（事實一律以原始報導為準；沒有被指出的內容盡量不要動），重新輸出完整 JSON（所有欄位都要有）：\n" + fmt_issues(issues)}]
     raw_src = "\n".join(it["title"] + "\n" + it["body"] for it in cluster)
     last_err = None
     expanded = recopied = json_retry = False  # 擴寫、抄寫退回、JSON 重試各最多一次
     for attempt in range(4):
-        model, out = chat(msgs, temperature=0.5 if attempt == 0 else 0.7)
+        model, out = chat(msgs, temperature=(0.3 if prev is not None else 0.5) if attempt == 0 else 0.7)
         try:
             a = parse_json_obj(out)
         except Exception:
             last_err = "JSON 解析失敗"
-            log(f"[rewrite] 第 {attempt + 1} 次 JSON 解析失敗：{str(out)[:200]!r}")
+            log(f"[writer] 第 {attempt + 1} 次 JSON 解析失敗：{str(out)[:200]!r}")
             if json_retry:
                 break
             json_retry = True
-            msgs = msgs[:2] + [{"role": "assistant", "content": str(out)[:3000]}, {"role": "user", "content": "請只輸出一個合法 JSON 物件，不要 ``` 也不要任何說明文字。"}]
+            msgs = msgs + [{"role": "assistant", "content": str(out)[:3000]}, {"role": "user", "content": "請只輸出一個合法 JSON 物件，不要 ``` 也不要任何說明文字。"}]
+            msgs = msgs[:2] + msgs[-4:] if len(msgs) > 8 else msgs
             continue
-        zh, en = str(a.get("article_zh") or ""), str(a.get("article_en") or "")
-        n_zh = han_len(zh)
-        segs = copied_segments(zh, raw_src)
-        ratio = shingle_ratio(zh, raw_src)
-        copied = bool(segs) or ratio > 0.22
-        title_same = any(norm(a.get("title_zh", "")) == norm(it["title"]) for it in cluster)
-        short_en = len(en.split()) < 120
         if a.get("category") not in ("news", "tech"):
-            a["category"] = cluster[0]["cat"]
-        fatal = []
-        if n_zh < 200:
-            fatal.append(f"中文正文只有 {n_zh} 字，至少要 260 字（只能用原始報導裡已有的事實擴寫細節與背景，不可捏造任何原文沒有的內容）")
-        if copied:
-            fatal.append("以下片段與原文幾乎相同，請完全改用自己的句子重寫：" + "；".join(segs[:6]) + f"（重複比例 {ratio:.0%}）")
-        if title_same:
-            fatal.append("中文標題不可與原始標題相同，請換一個說法")
-        soft = ["英文正文太短，需要 180–320 個英文字"] if short_en else []
-        for q in sorted({q for it in cluster for q in re.findall(r"[「『“\"]([^」』”\"]{2,12})[」』”\"]", it["title"])}):
-            if q not in zh:
-                fatal.append(f"原文的專有名稱「{q}」必須一字不改照抄（目前文章沒有出現或寫錯了）")
-        for zk, ek in GLOSSARY:
-            if zk in zh and ek.lower() not in en.lower():
-                soft.append(f"英文版「{zk}」要寫成 {ek}")
+            a["category"] = (prev or {}).get("category") or cluster[0]["cat"]
+        fatal, soft, n_zh, copied, ratio = local_check(a, cluster, raw_src)
         if not fatal and (not soft or attempt > 0):
             a["_model"] = model
             a["_ratio"] = round(ratio, 3)
             return a
-        # 擴寫最多一次、抄寫退回最多一次；已用過就放棄
         if (n_zh < 200 and expanded) or (copied and recopied):
             last_err = "；".join(fatal)
             break
@@ -405,9 +451,103 @@ def rewrite(cluster):
         if copied:
             recopied = True
         last_err = "；".join(fatal + soft)
-        log(f"[rewrite] 第 {attempt + 1} 次不合格：{last_err[:300]}")
-        msgs = msgs[:2] + [{"role": "assistant", "content": json.dumps(a, ensure_ascii=False)[:4000]}, {"role": "user", "content": "這篇不合格：" + last_err + "。請修正後重新輸出完整 JSON（所有欄位都要有）。"}]
+        log(f"[writer] 第 {attempt + 1} 次程式檢查不合格：{last_err[:300]}")
+        msgs = base + [{"role": "assistant", "content": json.dumps(a, ensure_ascii=False)[:6000]}, {"role": "user", "content": "這篇不合格：" + last_err + "。請修正後重新輸出完整 JSON（所有欄位都要有）。"}]
     raise ValueError(last_err or "改寫失敗")
+
+
+REVIEW_SYSTEM = """你是 Taiwan INFO 台灣資訊的資深審稿編輯（AI#2）。你會拿到「原始報導全文」與「改寫後的中英文章」（JSON）。請逐字對照原始報導，只找出真正的錯誤，不要改寫風格。
+
+檢查項目：
+1. 錯字、錯別字、同音字誤用（中文與英文都要看）。
+2. 與原文不符的事實、數字、金額、百分比、日期、人名、職稱、機構名、地名；原文沒有的內容（捏造、推測）。
+3. 「」引號內的名稱（活動、口號、政策、作品）必須與原文一字不差。
+4. 英文專有名詞誤譯或自創：例如 民進黨 = Democratic Progressive Party（不是 Min-Hsin Party）、國民黨 = Kuomintang、民眾黨 = Taiwan People's Party、金管會 = Financial Supervisory Commission、中選會 = Central Election Commission、立法院 = Legislative Yuan、行政院 = Executive Yuan、新南向國家 = New Southbound Policy countries；本益比 = price-to-earnings (P/E) ratio（不是 earnings per share，EPS 是每股盈餘）；公司、機構不可自編英文名（例如 安聯投信 = Allianz Global Investors Taiwan，不是 Union Asset Management），不確定就用通行英文名或羅馬拼音。
+5. 英文金額單位換算：1 億 = 100 million、10 億 = 1 billion、1 兆 = 1 trillion，且保留原數字精確度（811.8 億元 = NT$81.18 billion，不是 NT$81.1 billion；98.5 億元 = NT$9.85 billion；3.5 億元 = NT$350 million）。
+6. 不可用站在台灣視角的代稱「本國」「我國」「國內」「本土」「國人」，一律明寫「台灣」；英文不可用 domestic、our country、local banks，要寫 Taiwan／Taiwanese（例如 Taiwanese banks、Taiwan's banks）。
+7. 中英文版的事實要一致（英文版不可漏改數字或與中文矛盾）。
+
+規則：
+- 只列出確定的錯誤；風格、措辭、句子長短、同義說法（例如 a year earlier／year on year／from the same period last year 都對應「較去年同期」）、英文標題大小寫都不算錯。原文沒寫而文章也沒寫的不算錯。
+- 確認正確的地方不要列出來（wrong 與 correct 相同的不要列）。
+- 原文的「今年」「昨天」等相對日期，依原文發布時間換算成完整日期或年份是正確的，不算捏造。現在時間見下方；不要自己做民國／西元換算去推翻文章寫的年份。
+- 「缺少資訊」「建議補充」「建議加上年份」「可以寫得更清楚」都不是錯誤，不要列出；只列文章「寫錯」的地方。
+- wrong 必須是從文章該欄位「原樣複製」的一小段文字（5–60 字），correct 是改正後的文字，reason 用繁體中文簡短說明並指出原文依據。
+- field 只能是 title_zh、title_en、summary_zh、summary_en、article_zh、article_en、tags 之一。
+- 沒有錯誤時 pass 為 true、issues 為空陣列。
+
+只輸出一個 JSON 物件（不要 ``` 也不要說明文字）：
+{"pass": true 或 false, "issues": [{"field": "...", "wrong": "...", "correct": "...", "reason": "..."}]}"""
+
+REVIEW_FIELDS = ("title_zh", "title_en", "summary_zh", "summary_en", "article_zh", "article_en", "tags")
+
+
+def review(a, cluster):
+    """AI#2 審稿：附原始報導全文。回傳 (pass, issues, model)。issues 只保留 wrong 真的出現在該欄位的項目。"""
+    art = {k: a.get(k) for k in REVIEW_FIELDS}
+    nw = datetime.now(TZ)
+    user = f"現在時間（台北）：西元 {nw:%Y-%m-%d %H:%M}（民國 {nw.year - 1911} 年；原文的「今年」＝西元 {nw.year} 年）\n\n【原始報導全文】\n" + source_text(cluster, full=True) + "\n\n【改寫後的文章（JSON）】\n" + json.dumps(art, ensure_ascii=False, indent=1) + "\n\n請依審稿規則檢查，只輸出 JSON。"
+    msgs = [{"role": "system", "content": REVIEW_SYSTEM}, {"role": "user", "content": user}]
+    for attempt in range(2):
+        model, out = chat(msgs, max_tokens=REVIEW_MAX_TOKENS, temperature=0.1, role="reviewer", thinking=REVIEW_THINKING)
+        try:
+            r = parse_json_obj(out)
+            if not isinstance(r.get("pass"), bool) or not isinstance(r.get("issues", []), list):
+                raise ValueError("格式不符")
+        except Exception as e:
+            log(f"[reviewer] 第 {attempt + 1} 次輸出無法解析（{e}）：{str(out)[:200]!r}")
+            continue
+        issues, dropped = [], []
+        for x in r.get("issues") or []:
+            if not isinstance(x, dict):
+                continue
+            f, w, c = str(x.get("field") or ""), str(x.get("wrong") or "").strip(), str(x.get("correct") or "").strip()
+            text = " ".join(map(str, a.get(f) or [])) if f == "tags" else str(a.get(f) or "")
+            if f not in REVIEW_FIELDS or not w or w == c or w not in text:
+                dropped.append(x)
+                continue
+            issues.append({"field": f, "wrong": w, "correct": c, "reason": str(x.get("reason") or "")})
+        if dropped:
+            log(f"[reviewer] 忽略 {len(dropped)} 條無法對應文章原文的意見：{json.dumps(dropped, ensure_ascii=False)[:300]}")
+        return (not issues), issues, model
+    raise ValueError("審稿模型輸出無法解析")
+
+
+def reverts(history):
+    """最新一輪的意見是否要求改回前面某輪被指為錯的寫法（審稿模型自相矛盾）。"""
+    if len(history) < 2:
+        return False
+    old_wrong = {x["wrong"] for h in history[:-1] for x in h["issues"]}
+    return any(x["correct"] in old_wrong for x in history[-1]["issues"])
+
+
+def write_and_review(cluster, max_rounds=3):
+    """AI#1 撰稿（含程式檢查）→ AI#2 審稿；有錯退回 AI#1 修改再審，最多 max_rounds 輪審稿。回傳 (文章, 審稿紀錄)；不通過丟 ValueError。"""
+    a = rewrite(cluster)
+    history, seen = [], set()
+    for rnd in range(1, max_rounds + 1):
+        ok, issues, rm = review(a, cluster)
+        history.append({"round": rnd, "pass": ok, "issues": issues, "model": rm})
+        if ok:
+            log(f"[review] 第 {rnd} 輪通過（{rm}）")
+            a["_review"] = history
+            return a, history
+        log(f"[review] 第 {rnd} 輪退回（{rm}），{len(issues)} 條：\n" + fmt_issues(issues))
+        key = json.dumps(sorted((x["field"], x["wrong"]) for x in issues), ensure_ascii=False)
+        if key in seen:
+            log("[review] 同樣的問題第二次出現，AI#1 修不好，停止")
+            break
+        if reverts(history):
+            log("[review] 審稿意見前後矛盾（要求改回上一輪的寫法），停止")
+            raise ValueError("審稿意見前後矛盾：" + fmt_issues(issues)[:300])
+        seen.add(key)
+        if rnd == max_rounds:
+            break
+        a = rewrite(cluster, prev=a, issues=issues)
+        still = [x for x in issues if x["wrong"] not in x["correct"] and x["wrong"] in (" ".join(map(str, a.get(x["field"]) or [])) if x["field"] == "tags" else str(a.get(x["field"]) or ""))]
+        if still:
+            log(f"[writer] 修改後仍保留 {len(still)} 處被指出的文字：" + "；".join(x["wrong"] for x in still)[:200])
+    raise ValueError(f"審稿 {len(history)} 輪仍不通過：" + fmt_issues(history[-1]["issues"])[:400])
 
 
 # ---------------- 主流程 ----------------
@@ -470,21 +610,25 @@ def main():
             y["body"] = bodies[k]
             k += 1
 
-    out, done = [], 0
+    out, done, skipped = [], 0, []
     for c in picks:
         if done >= n:
+            break
+        if time.time() - t0 > TIME_BUDGET:
+            log(f"[time] 已用 {time.time() - t0:.0f} 秒，超過 {TIME_BUDGET} 秒預算，剩下的留給下一次")
             break
         c = [y for y in c if han_len(y["body"]) >= 80] or c
         if sum(han_len(y["body"]) for y in c) < 150:
             log(f"[skip] 原文太短：{c[0]['title']}")
             continue
         try:
-            a = rewrite(c)
+            a, hist = write_and_review(c)
         except QuotaExhausted as e:
             log(f"[quota] {e}；本次跳過")
             break
         except Exception as e:
-            log(f"[skip] 改寫失敗：{c[0]['title']}：{e}")
+            log(f"[skip] 不發布：{c[0]['title']}：{e}")
+            skipped.append((c[0]["title"], str(e)[:200]))
             continue
         urls = sorted(y["url"] for y in c)
         sh = hashlib.sha256("\n".join(urls).encode()).hexdigest()[:24]
@@ -499,18 +643,19 @@ def main():
             "sources": [{"name": y["source"], "title": y["title"], "url": y["url"], "published_at": y["published"].isoformat() if y["published"] else None} for y in c],
             "source_hash": sh, "published_at": pub, "model": a["_model"],
         }
-        log(f"[ok] {art['id']} {art['title_zh']}（{a['_model']}，中文 {han_len(art['article_zh'])} 字，與原文 8 字重複比例 {a['_ratio']:.0%}）")
+        log(f"[ok] {art['id']} {art['title_zh']}（{a['_model']}，中文 {han_len(art['article_zh'])} 字，與原文 8 字重複比例 {a['_ratio']:.0%}，審稿 {len(hist)} 輪通過，退回 {len(hist) - 1} 次）")
         r = site_post([art])
         log(f"[post] {json.dumps(r, ensure_ascii=False)[:300]}")
         if r.get("ok"):
             out.append(art)
             done += 1
-    summary = f"本次新增 {len(out)} 篇，用時 {time.time() - t0:.0f} 秒"
+    summary = f"本次新增 {len(out)} 篇、審稿不通過跳過 {len(skipped)} 篇，用時 {time.time() - t0:.0f} 秒"
     log(summary)
     gs = os.environ.get("GITHUB_STEP_SUMMARY")
     if gs:
         with open(gs, "a") as f:
-            f.write(f"### {summary}\n\n" + "".join(f"- [{a['title_zh']}]({SITE}/articles/{a['id']})（{a['model']}）\n" for a in out))
+            f.write(f"### {summary}\n\n" + "".join(f"- [{a['title_zh']}]({SITE}/articles/{a['id']})（{a['model']}）\n" for a in out)
+                    + "".join(f"- 跳過：{t}（{r}）\n" for t, r in skipped))
 
 
 if __name__ == "__main__":
